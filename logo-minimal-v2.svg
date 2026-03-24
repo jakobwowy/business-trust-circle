@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300">
+  <rect width="400" height="300" fill="#ffffff"/>
+  
+  <!-- Main circle with gap at top -->
+  <path d="M 190 52 
+           A 80 80 0 1 0 210 52" 
+        fill="none" 
+        stroke="#1a1a1a" 
+        stroke-width="2.5" 
+        stroke-linecap="round"/>
+  
+  <!-- Small accent dot in the gap -->
+  <circle cx="200" cy="48" r="2.5" fill="#1a1a1a" opacity="0.4"/>
+  
+  <!-- Inner subtle ring -->
+  <circle cx="200" cy="130" r="40" fill="none" stroke="#1a1a1a" stroke-width="0.5" opacity="0.15"/>
+  
+  <!-- Text inside circle -->
+  <text x="200" y="122" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="11" font-weight="300" letter-spacing="5" fill="#1a1a1a">BUSINESS</text>
+  <text x="200" y="143" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="17" font-weight="300" letter-spacing="2.5" fill="#1a1a1a">Trust Circle</text>
+</svg>
