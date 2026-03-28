@@ -1,0 +1,147 @@
+# Git Commit Logger
+# Logs all pushed commits to the business-os.io API for time tracking and task correlation.
+#
+# Setup:
+# 1. Set repository/org secret GIT_LOG_API_KEY (API key with git_commits:write scope)
+# 2. Optionally set GIT_LOG_API_URL (default: https://api.business-os.io)
+# 3. Copy this workflow file to .github/workflows/log-commits.yml in each repo
+
+name: Log Commits
+
+on:
+  push:
+    branches: ['**']
+
+jobs:
+  log-commits:
+    runs-on: ubuntu-latest
+    if: github.event.head_commit != null
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect and send commits
+        env:
+          API_URL: ${{ secrets.GIT_LOG_API_URL || 'https://api.business-os.io' }}
+          API_KEY: ${{ secrets.GIT_LOG_API_KEY }}
+        run: |
+          if [ -z "$API_KEY" ]; then
+            echo "::warning::GIT_LOG_API_KEY secret not set, skipping commit logging"
+            exit 0
+          fi
+
+          # Extract repo owner and name from GITHUB_REPOSITORY
+          REPO_OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          BRANCH="${GITHUB_REF_NAME}"
+          REMOTE_URL="https://github.com/${GITHUB_REPOSITORY}.git"
+
+          # Collect commits from this push
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.event.after }}"
+
+          # Handle new branches (before is all zeros)
+          if echo "$BEFORE" | grep -qE '^0+$'; then
+            # New branch - only log the head commit
+            COMMIT_RANGE="$AFTER~1..$AFTER"
+          else
+            COMMIT_RANGE="${BEFORE}..${AFTER}"
+          fi
+
+          # Build JSON array of commits
+          COMMITS="[]"
+
+          for HASH in $(git rev-list --reverse "$COMMIT_RANGE" 2>/dev/null || echo "$AFTER"); do
+            MESSAGE=$(git log -1 --format='%B' "$HASH")
+            AUTHOR_NAME=$(git log -1 --format='%aN' "$HASH")
+            AUTHOR_EMAIL=$(git log -1 --format='%aE' "$HASH")
+            COMMITTED_AT=$(git log -1 --format='%at' "$HASH")
+
+            # Get diff stats
+            PARENT=$(git rev-parse "${HASH}^" 2>/dev/null || echo "")
+            if [ -n "$PARENT" ]; then
+              STAT_LINE=$(git diff --shortstat "$PARENT" "$HASH" 2>/dev/null || echo "")
+              FILES_CHANGED=$(echo "$STAT_LINE" | grep -oE '[0-9]+ file' | grep -oE '[0-9]+' || echo "0")
+              INSERTIONS=$(echo "$STAT_LINE" | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo "0")
+              DELETIONS=$(echo "$STAT_LINE" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo "0")
+
+              # Get per-file stats
+              FILES_JSON=$(git diff --numstat "$PARENT" "$HASH" 2>/dev/null | \
+                jq -R -s '[split("\n")[] | select(length > 0) | split("\t") |
+                  {file_path: .[2],
+                   change_type: "modified",
+                   insertions: (.[0] | if . == "-" then 0 else tonumber end),
+                   deletions: (.[1] | if . == "-" then 0 else tonumber end)}]' 2>/dev/null || echo "[]")
+            else
+              # Root commit
+              FILES_CHANGED=$(git diff-tree --root --no-commit-id --name-only -r "$HASH" | wc -l | tr -d ' ')
+              INSERTIONS=0
+              DELETIONS=0
+              FILES_JSON=$(git diff-tree --root --no-commit-id --name-only -r "$HASH" | \
+                jq -R -s '[split("\n")[] | select(length > 0) |
+                  {file_path: ., change_type: "added", insertions: 0, deletions: 0}]' 2>/dev/null || echo "[]")
+            fi
+
+            # Add commit to array
+            COMMIT_JSON=$(jq -n \
+              --arg hash "$HASH" \
+              --arg msg "$MESSAGE" \
+              --arg author "$AUTHOR_NAME" \
+              --arg email "$AUTHOR_EMAIL" \
+              --arg branch "$BRANCH" \
+              --arg owner "$REPO_OWNER" \
+              --arg repo "$REPO_NAME" \
+              --arg remote "$REMOTE_URL" \
+              --argjson files "$FILES_JSON" \
+              --argjson files_changed "${FILES_CHANGED:-0}" \
+              --argjson ins "${INSERTIONS:-0}" \
+              --argjson del "${DELETIONS:-0}" \
+              --argjson ts "$COMMITTED_AT" \
+              '{
+                commit_hash: $hash,
+                message: $msg,
+                author_name: $author,
+                author_email: $email,
+                branch: $branch,
+                repo_owner: $owner,
+                repo_name: $repo,
+                remote_url: $remote,
+                files: $files,
+                files_changed: $files_changed,
+                insertions: $ins,
+                deletions: $del,
+                committed_at: $ts
+              }')
+
+            COMMITS=$(echo "$COMMITS" | jq --argjson c "$COMMIT_JSON" '. + [$c]')
+          done
+
+          COMMIT_COUNT=$(echo "$COMMITS" | jq 'length')
+          echo "Sending $COMMIT_COUNT commit(s) to API..."
+
+          if [ "$COMMIT_COUNT" -eq 0 ]; then
+            echo "No commits to send"
+            exit 0
+          fi
+
+          # Send bulk request
+          PAYLOAD=$(jq -n --argjson commits "$COMMITS" '{commits: $commits}')
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "${API_URL}/api/v1/git-commits/logs/bulk" \
+            -H "Authorization: Basic $(echo -n "$API_KEY" | base64)" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Success ($HTTP_CODE): $BODY"
+          else
+            echo "::warning::API returned $HTTP_CODE: $BODY"
+          fi
