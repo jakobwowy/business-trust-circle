@@ -30,8 +30,8 @@ jobs:
           API_KEY: ${{ secrets.GIT_LOG_API_KEY }}
         run: |
           if [ -z "$API_KEY" ]; then
-            echo "::warning::GIT_LOG_API_KEY secret not set, skipping commit logging"
-            exit 0
+            echo "::error::GIT_LOG_API_KEY secret not set — commit logging NOT happening. Set it: gh secret set GIT_LOG_API_KEY --repo ${GITHUB_REPOSITORY} < keyfile"
+            exit 1
           fi
 
           # Extract repo owner and name from GITHUB_REPOSITORY
@@ -52,8 +52,12 @@ jobs:
             COMMIT_RANGE="${BEFORE}..${AFTER}"
           fi
 
-          # Build JSON array of commits
-          COMMITS="[]"
+          # Build JSON array of commits.
+          # Jeder Commit wird als eine JSON-Zeile in eine Datei angehaengt statt in
+          # eine Shell-Variable akkumuliert: der Payload wird sonst bei groesseren
+          # Pushes (Merge mit vielen Commits) zu gross fuer die Weitergabe an curl.
+          COMMITS_FILE="$(mktemp)"
+          PAYLOAD_FILE="$(mktemp)"
 
           for HASH in $(git rev-list --reverse "$COMMIT_RANGE" 2>/dev/null || echo "$AFTER"); do
             MESSAGE=$(git log -1 --format='%B' "$HASH")
@@ -86,8 +90,8 @@ jobs:
                   {file_path: ., change_type: "added", insertions: 0, deletions: 0}]' 2>/dev/null || echo "[]")
             fi
 
-            # Add commit to array
-            COMMIT_JSON=$(jq -n \
+            # Add commit to array (eine kompakte JSON-Zeile pro Commit)
+            jq -c -n \
               --arg hash "$HASH" \
               --arg msg "$MESSAGE" \
               --arg author "$AUTHOR_NAME" \
@@ -115,12 +119,10 @@ jobs:
                 insertions: $ins,
                 deletions: $del,
                 committed_at: $ts
-              }')
-
-            COMMITS=$(echo "$COMMITS" | jq --argjson c "$COMMIT_JSON" '. + [$c]')
+              }' >> "$COMMITS_FILE"
           done
 
-          COMMIT_COUNT=$(echo "$COMMITS" | jq 'length')
+          COMMIT_COUNT=$(wc -l < "$COMMITS_FILE" | tr -d ' ')
           echo "Sending $COMMIT_COUNT commit(s) to API..."
 
           if [ "$COMMIT_COUNT" -eq 0 ]; then
@@ -128,14 +130,21 @@ jobs:
             exit 0
           fi
 
-          # Send bulk request
-          PAYLOAD=$(jq -n --argjson commits "$COMMITS" '{commits: $commits}')
+          # Send bulk request. Der Payload geht als Datei an curl (`--data-binary @`),
+          # nicht als Argument — ein einzelnes argv-Element ist unter Linux auf 128 KiB
+          # begrenzt (MAX_ARG_STRLEN), was ab ~40 Commits gerissen wird.
+          jq -s '{commits: .}' "$COMMITS_FILE" > "$PAYLOAD_FILE"
+          echo "Payload size: $(wc -c < "$PAYLOAD_FILE" | tr -d ' ') bytes"
+
+          # base64 der GNU-coreutils umbricht ab 76 Zeichen — die Zeilenumbrueche
+          # muessen raus, sonst zerfaellt der Auth-Header bei langen API-Keys.
+          AUTH_B64=$(printf '%s' "$API_KEY" | base64 | tr -d '\n')
 
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "${API_URL}/api/v1/git-commits/logs/bulk" \
-            -H "Authorization: Basic $(echo -n "$API_KEY" | base64)" \
+            -H "Authorization: Basic ${AUTH_B64}" \
             -H "Content-Type: application/json" \
-            -d "$PAYLOAD")
+            --data-binary "@${PAYLOAD_FILE}")
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           BODY=$(echo "$RESPONSE" | head -n -1)
@@ -143,5 +152,6 @@ jobs:
           if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
             echo "Success ($HTTP_CODE): $BODY"
           else
-            echo "::warning::API returned $HTTP_CODE: $BODY"
+            echo "::error::API returned $HTTP_CODE: $BODY"
+            exit 1
           fi
